@@ -7,8 +7,9 @@ from splitter import split_documents
 from embedding import embed_chunks
 from vector_store import ChromaVectorStore
 from retriever import Retriever
-from llm import generate_answer
+from llm import generate_answer, generate_answer_stream
 from pathlib import Path
+from typing import Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -102,3 +103,37 @@ class SimpleRAG:
         answer = generate_answer(query, contexts)
 
         return answer
+
+    def ask_stream(
+        self,
+        query: str,
+        top_k: int = 3,
+        score_threshold: float | None = None
+    ) -> Iterator[str]:
+        """
+        用户提问（流式输出）。
+        """
+        if self.vector_store.is_empty():
+            yield "知识库为空，请先调用 build_index 构建索引。"
+            return
+
+        contexts = self.retriever.retrieve(
+            query=query,
+            top_k=top_k,
+            score_threshold=score_threshold
+        )
+
+        if not contexts:
+            yield "资料中没有相关信息。"
+            return
+
+        print("\n检索到的相关片段：")
+        for item in contexts:
+            print(
+                f"- score={item['score']:.4f}, "
+                f"distance={item['distance']:.4f}, "
+                f"source={item['source']}, "
+                f"chunk_id={item['chunk_id']}"
+            )
+
+        yield from generate_answer_stream(query, contexts)

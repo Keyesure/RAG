@@ -17,9 +17,10 @@ def main():
         if query.lower() in ["exit", "quit"]:
             break
 
-        answer = rag.ask(query)
         print("\n回答：")
-        print(answer)
+        for token in rag.ask_stream(query):
+            print(token, end="", flush=True)
+        print()
 
 
 if __name__ == "__main__":
