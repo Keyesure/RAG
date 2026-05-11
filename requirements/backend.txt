@@ -6,3 +6,4 @@ requests
 chromadb
 fastapi
 uvicorn
+sse-starlette

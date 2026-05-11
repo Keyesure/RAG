@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import json
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -72,16 +73,71 @@ def ask(payload: AskRequest) -> dict:
 
 
 @app.post("/ask/stream")
-def ask_stream(payload: AskRequest) -> StreamingResponse:
-    def token_generator():
+
+async def ask_stream(payload: AskRequest) -> StreamingResponse:
+    def sse_event(event: str,data)->str:
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    
+    async def token_generator():
+        """
+        使用SSE的流式输出应当返回:
+        event: token
+        data: {"text":"你好"}
+
+        event: token
+        data: {"text":"，这是回答"}
+
+        event: citations
+        data: [{"source":"xxx.pdf","page":3,"text":"引用片段..."}]
+
+        event: done
+        data: {}
+        """
         try:
-            for token in rag.ask_stream(
+            for stream in rag.ask_stream(
                 query=payload.query,
                 top_k=payload.top_k,
                 score_threshold=payload.score_threshold,
             ):
-                yield token
+                # 传输tokens
+                yield sse_event(stream["event"],stream["data"])
         except Exception as exc:  # noqa: BLE001
-            yield f"\n[ERROR] 问答失败: {exc}"
+            yield sse_event("error", {"message": f"问答失败: {exc}"})
+            yield sse_event("done", {})
 
     return StreamingResponse(token_generator(), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/overview")
+def overview() -> dict:
+    """
+    知识库概览：
+    - tracked_documents: 状态表中的文档数量
+    - indexed_chunks: 向量库 chunk 数量
+    - last_indexed_at: 最近一次写入向量库的时间戳（秒）
+    - documents: 文档清单（source + content_hash）
+    """
+    try:
+        documents = load_doc_status_list()
+
+        last_indexed_at = None
+        if not rag.vector_store.is_empty():
+            existing = rag.vector_store.collection.get(include=["metadatas"])
+            timestamps = []
+            for metadata in existing.get("metadatas", []):
+                if isinstance(metadata, dict) and metadata.get("updated_at"):
+                    try:
+                        timestamps.append(float(metadata["updated_at"]))
+                    except (ValueError, TypeError):
+                        continue
+            if timestamps:
+                last_indexed_at = max(timestamps)
+
+        return {
+            "tracked_documents": len(documents),
+            "indexed_chunks": rag.vector_store.count(),
+            "last_indexed_at": last_indexed_at,
+            "documents": documents,
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"获取概览失败: {exc}") from exc

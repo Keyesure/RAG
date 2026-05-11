@@ -123,6 +123,12 @@ button:disabled {
   color: #50627a;
 }
 
+.chat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .error-chip {
   align-self: center;
   color: #a41f2d;
@@ -161,6 +167,91 @@ button:disabled {
   white-space: pre-wrap;
   word-break: break-word;
   line-height: 1.55;
+}
+
+.chat-main {
+  display: grid;
+  grid-template-columns: 1fr 0;
+  min-height: 0;
+  overflow: hidden;
+  transition: grid-template-columns 0.24s ease;
+}
+
+.chat-main.viewer-open {
+  grid-template-columns: 1fr 340px;
+}
+
+.citation-links {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.citation-link {
+  background: #edf5ff;
+  color: #0a4f94;
+  border: 1px solid #bfdbff;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 0.76rem;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.doc-viewer {
+  border-left: 1px solid #d9e0ea;
+  background: #ffffffd9;
+  backdrop-filter: blur(4px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.doc-viewer-header {
+  padding: 12px;
+  border-bottom: 1px solid #e2e8f2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.doc-viewer-header h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #1d2a3a;
+}
+
+.doc-viewer-body {
+  padding: 12px;
+  overflow: auto;
+}
+
+.doc-viewer-source {
+  margin: 0;
+  font-size: 0.83rem;
+  color: #23415f;
+  word-break: break-all;
+}
+
+.doc-viewer-score {
+  margin: 6px 0 10px;
+  font-size: 0.78rem;
+  color: #5d7490;
+}
+
+.doc-viewer pre {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: 0.83rem;
+  line-height: 1.5;
+  color: #31465f;
+  background: #f5f8fc;
+  border: 1px solid #d8e2ef;
+  border-radius: 10px;
+  padding: 10px;
 }
 
 .bubble.user {
@@ -208,6 +299,17 @@ button:disabled {
   .chat {
     height: auto;
     max-height: calc(100vh - 260px);
+  }
+
+  .chat-main,
+  .chat-main.viewer-open {
+    grid-template-columns: 1fr;
+  }
+
+  .doc-viewer {
+    border-left: none;
+    border-top: 1px solid #d9e0ea;
+    max-height: 240px;
   }
 
   .chat-input {

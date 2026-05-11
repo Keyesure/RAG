@@ -25,6 +25,19 @@ type ChatMessage = {
   role: ChatRole
   content: string
   pending?: boolean
+  citations?: CitationItem[]
+}
+
+type CitationItem = {
+  source: string
+  chunk_id: number
+  text: string
+  score: number
+}
+
+type SseEnvelope = {
+  event: string
+  data: unknown
 }
 
 const API_PREFIX = '/api'
@@ -41,6 +54,9 @@ function App() {
   const [error, setError] = useState('')
   const [indexing, setIndexing] = useState(false)
   const [sending, setSending] = useState(false)
+  const [overview, setOverview] = useState<OverviewResponse | null>(null)
+  const [overviewLoading, setOverviewLoading] = useState(false)
+  const [docKeyword, setDocKeyword] = useState('')
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -65,6 +81,45 @@ function App() {
 
   const updateMessage = (id: string, patch: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)))
+  }
+
+  const toDataRelativeSource = (source: string): string => {
+    const marker = 'data/'
+    const index = source.lastIndexOf(marker)
+    if (index >= 0) {
+      return source.slice(index)
+    }
+    return source
+  }
+
+  const parseSseEvents = (buffer: string): { events: SseEnvelope[]; rest: string } => {
+    const parts = buffer.split('\n\n')
+    const rest = parts.pop() ?? ''
+    const events: SseEnvelope[] = []
+
+    for (const block of parts) {
+      const lines = block.split('\n')
+      let eventName = ''
+      let dataText = ''
+
+      for (const line of lines) {
+        if (line.startsWith('event:')) {
+          eventName = line.slice(6).trim()
+        } else if (line.startsWith('data:')) {
+          dataText += line.slice(5).trim()
+        }
+      }
+
+      if (!eventName || !dataText) continue
+
+      try {
+        events.push({ event: eventName, data: JSON.parse(dataText) })
+      } catch {
+        continue
+      }
+    }
+
+    return { events, rest }
   }
 
   const parseThreshold = (): number | null => {
@@ -161,16 +216,51 @@ function App() {
       const reader = resp.body.getReader()
       const decoder = new TextDecoder('utf-8')
       let result = ''
+      let sseBuffer = ''
+      let finished = false
+      let citations: CitationItem[] = []
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        result += decoder.decode(value, { stream: true })
-        updateMessage(assistantId, { content: result, pending: true })
+
+        sseBuffer += decoder.decode(value, { stream: true })
+        const { events, rest } = parseSseEvents(sseBuffer)
+        sseBuffer = rest
+
+        for (const item of events) {
+          if (item.event === 'token') {
+            const payload = item.data as { text?: string }
+            if (payload.text) {
+              result += payload.text
+              updateMessage(assistantId, { content: result, pending: true })
+            }
+          } else if (item.event === 'citations') {
+            const payload = item.data as { items?: CitationItem[] }
+            citations = Array.isArray(payload.items) ? payload.items : []
+          } else if (item.event === 'error') {
+            const payload = item.data as { message?: string }
+            throw new Error(payload.message || '流式问答失败')
+          } else if (item.event === 'done') {
+            finished = true
+          }
+        }
+
         chatBodyRef.current?.scrollTo({ top: chatBodyRef.current.scrollHeight, behavior: 'smooth' })
       }
 
-      updateMessage(assistantId, { content: result || '资料中没有相关信息。', pending: false })
+      if (!finished && !result) {
+        throw new Error('流式响应未正常完成')
+      }
+
+      updateMessage(assistantId, {
+        content: result || '资料中没有相关信息。',
+        pending: false,
+        citations,
+      })
+      if (citations.length > 0 && !selectedCitation) {
+        setSelectedCitation(citations[0])
+      }
       setStatusText('回答完成')
     } catch (err) {
       const msg = err instanceof Error ? err.message : '问答失败'
@@ -244,16 +334,61 @@ function App() {
             <h1>Knowledge Chat</h1>
             <p>{statusText}</p>
           </div>
-          {error && <span className="error-chip">{error}</span>}
+          <div className="chat-header-actions">
+            <button type="button" className="ghost" onClick={() => setViewerOpen((v) => !v)}>
+              {viewerOpen ? '折叠文档查看' : '展开文档查看'}
+            </button>
+            {error && <span className="error-chip">{error}</span>}
+          </div>
         </header>
 
-        <div className="chat-body" ref={chatBodyRef}>
-          {messages.map((msg) => (
-            <article key={msg.id} className={`bubble ${msg.role}`}>
-              <div className="role">{msg.role === 'user' ? '你' : msg.role === 'assistant' ? '助手' : '系统'}</div>
-              <div className="content">{msg.content || (msg.pending ? '正在生成...' : '')}</div>
-            </article>
-          ))}
+        <div className={`chat-main ${viewerOpen ? 'viewer-open' : ''}`}>
+          <div className="chat-body" ref={chatBodyRef}>
+            {messages.map((msg) => (
+              <article key={msg.id} className={`bubble ${msg.role}`}>
+                <div className="role">{msg.role === 'user' ? '你' : msg.role === 'assistant' ? '助手' : '系统'}</div>
+                <div className="content">{msg.content || (msg.pending ? '正在生成...' : '')}</div>
+                {msg.citations && msg.citations.length > 0 && (
+                  <div className="citation-links">
+                    {msg.citations.map((item, idx) => (
+                      <button
+                        type="button"
+                        key={`${item.source}-${item.chunk_id}-${idx}`}
+                        className="citation-link"
+                        onClick={() => {
+                          setSelectedCitation(item)
+                          setViewerOpen(true)
+                        }}
+                        title={`${toDataRelativeSource(item.source)} · chunk ${item.chunk_id}`}
+                      >
+                        [{idx + 1}] {toDataRelativeSource(item.source)}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+
+          <aside className={`doc-viewer ${viewerOpen ? 'open' : ''}`}>
+            <div className="doc-viewer-header">
+              <h3>文档查看</h3>
+              <button type="button" className="ghost" onClick={() => setViewerOpen(false)}>
+                折叠
+              </button>
+            </div>
+            {selectedCitation ? (
+              <div className="doc-viewer-body">
+                <p className="doc-viewer-source">
+                  {toDataRelativeSource(selectedCitation.source)} · chunk {selectedCitation.chunk_id}
+                </p>
+                <p className="doc-viewer-score">score: {selectedCitation.score.toFixed(3)}</p>
+                <pre>{selectedCitation.text}</pre>
+              </div>
+            ) : (
+              <p className="tiny">暂无可预览引用，先提问获取引用信息。</p>
+            )}
+          </aside>
         </div>
 
         <form className="chat-input" onSubmit={sendMessage}>
