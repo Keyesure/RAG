@@ -4,11 +4,12 @@
 .DS_Store
 
 
-src/__pycache__/
+__pycache__/
 
 .vscode/
 
 data/
+
 storage/
 *.db
 *.sqlite

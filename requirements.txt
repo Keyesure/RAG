@@ -1,6 +1,1 @@
-numpy
-sentence-transformers
-python-dotenv
-openai
-requests
-chromadb
+-r requirements/backend.txt
