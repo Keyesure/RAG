@@ -50,7 +50,8 @@ def split_documents(documents: list[dict], chunk_size: int = 500, overlap: int =
             all_chunks.append({
                 "source": doc["source"],
                 "chunk_id": i,
-                "text": chunk
+                "text": chunk,
+                "content_hash": doc["content_hash"]
             })
 
     return all_chunks

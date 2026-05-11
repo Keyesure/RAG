@@ -2,12 +2,17 @@
 # 负责把文本 chunk 转换成真正的语义向量 embedding。
 # 当前版本使用 Ollama 本地 bge-m3 模型。
 
+import os
+
 import requests
 import numpy as np
+from dotenv import load_dotenv
 
+load_dotenv()
 
-OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
-DEFAULT_EMBEDDING_MODEL = "bge-m3"
+OLLAMA_EMBED_URL = os.getenv("OLLAMA_EMBED_URL", "http://localhost:11434/api/embed")
+DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "bge-m3")
+
 
 # text_to_embedding 函数使用 Ollama 的 embed API 把文本转换成向量。
 def text_to_embedding(

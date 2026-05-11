@@ -18,6 +18,18 @@ type HealthResponse = {
   indexed_chunks: number
 }
 
+type OverviewDocument = {
+  source: string
+  content_hash: string
+}
+
+type OverviewResponse = {
+  tracked_documents: number
+  indexed_chunks: number
+  last_indexed_at: number | null
+  documents: OverviewDocument[]
+}
+
 type ChatRole = 'user' | 'assistant' | 'system'
 
 type ChatMessage = {
@@ -41,6 +53,9 @@ function App() {
   const [error, setError] = useState('')
   const [indexing, setIndexing] = useState(false)
   const [sending, setSending] = useState(false)
+  const [overview, setOverview] = useState<OverviewResponse | null>(null)
+  const [overviewLoading, setOverviewLoading] = useState(false)
+  const [docKeyword, setDocKeyword] = useState('')
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -53,6 +68,12 @@ function App() {
   const chatBodyRef = useRef<HTMLDivElement | null>(null)
 
   const canSend = useMemo(() => input.trim().length > 0 && !sending, [input, sending])
+  const filteredDocs = useMemo(() => {
+    if (!overview) return []
+    const keyword = docKeyword.trim().toLowerCase()
+    if (!keyword) return overview.documents
+    return overview.documents.filter((item) => item.source.toLowerCase().includes(keyword))
+  }, [overview, docKeyword])
 
   const addMessage = (role: ChatRole, content: string, pending = false): string => {
     const id = crypto.randomUUID()
@@ -127,12 +148,31 @@ function App() {
       setHealth({ status: 'ok', indexed_chunks: data.indexed_chunks })
       setStatusText(`${data.message}，chunks: ${data.indexed_chunks}`)
       addMessage('system', `索引已更新：${data.indexed_chunks} chunks。`) 
+      void fetchOverview()
     } catch (err) {
       const msg = err instanceof Error ? err.message : '构建索引失败'
       setError(msg)
       setStatusText('索引失败')
     } finally {
       setIndexing(false)
+    }
+  }
+
+  const fetchOverview = async () => {
+    clearBanner()
+    setOverviewLoading(true)
+    try {
+      const resp = await fetch(`${API_PREFIX}/overview`)
+      if (!resp.ok) throw new Error(await readError(resp))
+      const data = (await resp.json()) as OverviewResponse
+      setOverview(data)
+      setStatusText('知识库概览已更新')
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '获取概览失败'
+      setError(msg)
+      setStatusText('概览获取失败')
+    } finally {
+      setOverviewLoading(false)
     }
   }
 
@@ -234,6 +274,49 @@ function App() {
                 placeholder="可选，如 0.3"
               />
             </label>
+          </div>
+
+          <div className="overview">
+            <div className="overview-title">
+              <h3>知识库概览</h3>
+              <button type="button" className="ghost" onClick={fetchOverview} disabled={overviewLoading}>
+                {overviewLoading ? '刷新中...' : '刷新'}
+              </button>
+            </div>
+
+            <div className="kpi-grid">
+              <div className="kpi-card">
+                <span>文档总数</span>
+                <strong>{overview ? overview.tracked_documents : '-'}</strong>
+              </div>
+              <div className="kpi-card">
+                <span>向量块数</span>
+                <strong>{overview ? overview.indexed_chunks : '-'}</strong>
+              </div>
+            </div>
+
+            <p className="tiny">
+              最近索引时间：
+              {overview?.last_indexed_at
+                ? new Date(overview.last_indexed_at * 1000).toLocaleString()
+                : '暂无'}
+            </p>
+
+            <input
+              value={docKeyword}
+              onChange={(e) => setDocKeyword(e.target.value)}
+              placeholder="按路径搜索文档"
+            />
+
+            <div className="doc-list">
+              {filteredDocs.slice(0, 80).map((doc) => (
+                <div key={doc.source} className="doc-item">
+                  <p className="doc-source">{doc.source}</p>
+                  <p className="doc-hash">{doc.content_hash.slice(0, 12)}...</p>
+                </div>
+              ))}
+              {overview && filteredDocs.length === 0 && <p className="tiny">没有匹配文档</p>}
+            </div>
           </div>
         </div>
       </aside>

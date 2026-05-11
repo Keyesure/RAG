@@ -2,25 +2,35 @@
 # 简单的 RAG 系统实现。
 # 当前版本使用 Chroma 作为本地持久化向量库。
 
+import os
+from pathlib import Path
+from typing import Iterator
+
+from dotenv import load_dotenv
+
 from loader import load_documents_from_dir
 from splitter import split_documents
 from embedding import embed_chunks
 from vector_store import ChromaVectorStore
 from retriever import Retriever
 from llm import generate_answer, generate_answer_stream
-from pathlib import Path
-from typing import Iterator
+from doc_state import update_doc_status_list
 
+load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PERSIST_DIR = PROJECT_ROOT / "storage" / "chroma"
+DEFAULT_DATA_DIR = os.getenv("DATA_DIR", "data")
+DEFAULT_PERSIST_DIR = os.getenv(
+    "CHROMA_PERSIST_DIR", str(PROJECT_ROOT / "storage" / "chroma")
+)
+DEFAULT_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "rag_chunks")
 
 
 class SimpleRAG:
     def __init__(
         self,
-        persist_dir: str = str(DEFAULT_PERSIST_DIR),
-        collection_name: str = "rag_chunks"
+        persist_dir: str = DEFAULT_PERSIST_DIR,
+        collection_name: str = DEFAULT_COLLECTION_NAME
     ):
         self.vector_store = ChromaVectorStore(
             persist_dir=persist_dir,
@@ -30,7 +40,7 @@ class SimpleRAG:
 
     def build_index(
         self,
-        data_dir: str,
+        data_dir: str = DEFAULT_DATA_DIR,
         force_rebuild: bool = False
     ):
         """
@@ -46,15 +56,16 @@ class SimpleRAG:
             print("正在清空旧 Chroma 索引...")
             self.vector_store.clear()
 
-        if not self.vector_store.is_empty():
-            print("已加载 Chroma 向量索引，无需重新构建。")
-            print(f"当前索引包含 {self.vector_store.count()} 个文本块")
-            return
 
         print("正在读取文档...")
-        documents = load_documents_from_dir(data_dir)
+        documents, deleted_docs = load_documents_from_dir(data_dir)
+        
+        if not documents and not deleted_docs:
+            print("没有新的文档需要处理。")
+            return
 
         print(f"读取到 {len(documents)} 个文档")
+
 
         print("正在切分文本...")
         chunks = split_documents(documents)
@@ -65,7 +76,13 @@ class SimpleRAG:
         embedded_chunks = embed_chunks(chunks)
 
         print("正在写入 Chroma 向量库...")
+        # 先delete再add
+        self.vector_store.delete_by_source(deleted_docs)
         self.vector_store.add(embedded_chunks)
+        
+        print("正在更新文档状态列表...")
+        update_doc_status_list(documents, deleted_docs)
+        print("文档状态列表更新完成")
 
         print("索引构建完成")
         print(f"当前索引包含 {self.vector_store.count()} 个文本块")

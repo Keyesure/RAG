@@ -1,14 +1,21 @@
 # vector_store.py
 # 使用 Chroma 实现本地持久化向量库。
 
+import os
 from pathlib import Path
-
+import datetime
 import chromadb
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BATCH_SIZE = 1000
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PERSIST_DIR = PROJECT_ROOT / "storage" / "chroma"
+DEFAULT_PERSIST_DIR = Path(
+    os.getenv("CHROMA_PERSIST_DIR", str(PROJECT_ROOT / "storage" / "chroma"))
+)
+DEFAULT_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "rag_chunks")
 
 
 class ChromaVectorStore:
@@ -25,7 +32,7 @@ class ChromaVectorStore:
     def __init__(
         self,
         persist_dir: str = str(DEFAULT_PERSIST_DIR),
-        collection_name: str = "rag_chunks",
+        collection_name: str = DEFAULT_COLLECTION_NAME,
     ):
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
@@ -48,18 +55,18 @@ class ChromaVectorStore:
         # 分批次添加，避免一次性插入过多数据导致内存问题。
         for start in range(0, total, BATCH_SIZE):
             # 取出当前批次的数据。
-            batch = embedded_chunks[start : start + BATCH_SIZE]
+            batch = embedded_chunks[start: start + BATCH_SIZE]
             """
-            embeded_chunks 的每个 item 包含 
+            embeded_chunks 的每个 item 包含
             source、
             chunk_id、
             text、
-            embedding 
-            四个字段，我们需要将它们分别提取出来，准备好 
+            embedding
+            四个字段，我们需要将它们分别提取出来，准备好
             ids、
             doctcuments、
             embeddings、
-            metadatas 
+            metadatas
             四个列表，以便后续调用 collection.upsert() 方法进行批量插入或更新。
             """
             ids = []
@@ -83,15 +90,36 @@ class ChromaVectorStore:
                     np.asarray(item["embedding"], dtype=np.float32).tolist()
                 )
                 # 元数据包含 source 和 chunk_id，这样我们在检索时就可以知道每个文档块的来源和位置。
-                metadatas.append({"source": source, "chunk_id": chunk_id})
+                metadata = {"source": source, "chunk_id": chunk_id, "updated_at": str(datetime.datetime.now().timestamp())}
+                if "content_hash" in item:
+                    metadata["content_hash"] = item["content_hash"]
+                metadatas.append(metadata)
 
             # upsert：如果 id 已存在就更新，不存在就新增。
             self.collection.upsert(
-                ids=ids, 
-                documents=documents, 
-                embeddings=embeddings, 
+                ids=ids,
+                documents=documents,
+                embeddings=embeddings,
                 metadatas=metadatas
             )
+
+    def delete_by_source(self, sources: list[str]):
+        """
+        根据 source 删除对应的 chunk。
+        """
+        if not sources:
+            return
+
+        existing = self.collection.get()
+
+        ids_to_delete = []
+
+        for doc_id, metadata in zip(existing.get("ids", []), existing.get("metadatas", [])):
+            if metadata["source"] in sources:
+                ids_to_delete.append(doc_id)
+
+        if ids_to_delete:
+            self.collection.delete(ids=ids_to_delete)
 
     def similarity_search(
         self,

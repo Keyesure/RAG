@@ -1,13 +1,21 @@
 # llm.py 负责根据用户问题和检索到的相关文档块生成最终回答，目前使用一个简单的字符串拼接来模拟回答生成，后续可以替换成真正的 LLM 调用。
 
+import os
 import requests
 import json
 from typing import Iterator
+from dotenv import load_dotenv
+
+load_dotenv()
+
+OLLAMA_GENERATE_URL = os.getenv("LLM_GENERATE_URL", "http://localhost:11434/api/generate")
+DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "qwen3.6")
+
 
 def generate_answer_with_ollama_stream(
     query: str,
     contexts: list[dict],
-    model: str = "qwen3.6"
+    model: str = DEFAULT_LLM_MODEL
 ) -> Iterator[str]:
     context_text = "\n\n".join([
         f"[来源: {item['source']}]\n{item['text']}"
@@ -35,7 +43,7 @@ def generate_answer_with_ollama_stream(
 
     try:
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            OLLAMA_GENERATE_URL,
             json={
                 "model": model,
                 "prompt": prompt,
@@ -71,7 +79,8 @@ def generate_answer_with_ollama_stream(
             f"\n错误详情: {exc}"
         )
 
-def generate_answer(query: str, contexts: list[dict], model: str = "qwen3.6") -> str:
+
+def generate_answer(query: str, contexts: list[dict], model: str = DEFAULT_LLM_MODEL) -> str:
     """
     对外统一的答案生成入口。
     """
@@ -81,7 +90,7 @@ def generate_answer(query: str, contexts: list[dict], model: str = "qwen3.6") ->
 def generate_answer_stream(
     query: str,
     contexts: list[dict],
-    model: str = "qwen3.6"
+    model: str = DEFAULT_LLM_MODEL
 ) -> Iterator[str]:
     """
     对外统一的流式答案生成入口。

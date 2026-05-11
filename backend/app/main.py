@@ -14,7 +14,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from rag import SimpleRAG  # noqa: E402
+from src.rag import SimpleRAG  # noqa: E402
+from src.doc_state import load_doc_status_list  # noqa: E402
 
 
 app = FastAPI(title="Simple RAG Backend", version="1.0.0")
@@ -85,3 +86,38 @@ def ask_stream(payload: AskRequest) -> StreamingResponse:
             yield f"\n[ERROR] 问答失败: {exc}"
 
     return StreamingResponse(token_generator(), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/overview")
+def overview() -> dict:
+    """
+    知识库概览：
+    - tracked_documents: 状态表中的文档数量
+    - indexed_chunks: 向量库 chunk 数量
+    - last_indexed_at: 最近一次写入向量库的时间戳（秒）
+    - documents: 文档清单（source + content_hash）
+    """
+    try:
+        documents = load_doc_status_list()
+
+        last_indexed_at = None
+        if not rag.vector_store.is_empty():
+            existing = rag.vector_store.collection.get(include=["metadatas"])
+            timestamps = []
+            for metadata in existing.get("metadatas", []):
+                if isinstance(metadata, dict) and metadata.get("updated_at"):
+                    try:
+                        timestamps.append(float(metadata["updated_at"]))
+                    except (ValueError, TypeError):
+                        continue
+            if timestamps:
+                last_indexed_at = max(timestamps)
+
+        return {
+            "tracked_documents": len(documents),
+            "indexed_chunks": rag.vector_store.count(),
+            "last_indexed_at": last_indexed_at,
+            "documents": documents,
+        }
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"获取概览失败: {exc}") from exc
