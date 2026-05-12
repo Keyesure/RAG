@@ -3,14 +3,14 @@
 # 当前版本使用 Chroma 作为本地持久化向量库。
 
 from loader import load_documents_from_dir
-from splitter import split_documents
+from doc_state import update_doc_status_list
+from splitter import TextSplitter
 from embedding import embed_chunks
 from vector_store import ChromaVectorStore
 from retriever import Retriever
 from llm import generate_answer, generate_answer_stream
 from pathlib import Path
-from typing import Iterator
-
+from typing import Callable, Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PERSIST_DIR = PROJECT_ROOT / "storage" / "chroma"
@@ -22,17 +22,33 @@ class SimpleRAG:
     def __init__(
         self,
         persist_dir: str = DEFAULT_PERSIST_DIR,
-        collection_name: str = DEFAULT_COLLECTION_NAME
+        chunk_size: int = 500,
+        chunk_overlap: int = 100,
+        strategy: str = "simple"
     ):
+        collection_name=f"rag_{strategy}_{chunk_size}c{chunk_overlap}"
+        collection_meta={
+            "description": "RAG 知识库",
+            "strategy": strategy,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap
+        }
         self.vector_store = ChromaVectorStore(
-            persist_dir=persist_dir, collection_name=collection_name
+            persist_dir=persist_dir, 
+            collection_name=collection_name,
+            collection_meta=collection_meta
         )
         self.retriever = Retriever(self.vector_store)
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.strategy = strategy
 
     def build_index(
         self,
         data_dir: str = DEFAULT_DATA_DIR,
-        force_rebuild: bool = False
+        force_rebuild: bool = False,
+        incremental: bool = True,
+        progress_callback: Callable[[str, int], None] | None = None,
     ):
         """
         构建知识库索引。
@@ -41,35 +57,85 @@ class SimpleRAG:
             清空旧 collection，重新读取文档、切分、向量化、入库。
 
         force_rebuild=False：
-            如果 Chroma 里已有数据，直接复用。
+            默认走增量更新（incremental=True）。
+            若 incremental=False 且已有数据，则直接复用。
         """
+        def report(stage: str, progress: int) -> None:
+            if progress_callback is not None:
+                progress_callback(stage, progress)
+
+        report("开始处理索引任务", 0)
         if force_rebuild:
             print("正在清空旧 Chroma 索引...")
+            report("正在清空旧索引", 10)
             self.vector_store.clear()
-
+        elif not incremental and not self.vector_store.is_empty():
+            print("检测到已有索引，跳过重建。若需全量重建请设置 force_rebuild=True。")
+            report("检测到已有索引，已复用", 100)
+            return
 
         print("正在读取文档...")
-        documents = load_documents_from_dir(data_dir)
-        
-        if not documents:
+        report("正在读取文档", 20)
+        force_full_scan = force_rebuild or self.vector_store.is_empty()
+        documents, deleted_docs = load_documents_from_dir(
+            data_dir,
+            collection_name=self.vector_store.collection_name,
+            force_full_scan=force_full_scan,
+        )
+
+        if not documents and not deleted_docs:
             print("没有新的文档需要处理。")
+            # 全量扫描场景（如 force_rebuild）下，即使没有文档也要落空状态，
+            # 避免向量库已清空但状态表仍保留旧记录。
+            if force_full_scan:
+                print("正在更新文档状态列表...")
+                update_doc_status_list(
+                    collection_name=self.vector_store.collection_name,
+                    documents=[],
+                    deleted_docs=[],
+                    replace_all=True,
+                )
+                print("文档状态列表更新完成")
+            report("没有新的文档需要处理", 100)
             return
 
         print(f"读取到 {len(documents)} 个文档")
 
-        print("正在切分文本...")
-        chunks = split_documents(documents)
+        chunks = []
+        embedded_chunks = []
+        if documents:
+            print("正在切分文本...")
+            report("正在切分文本", 40)
+            splitter = TextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap,
+                strategy=self.strategy,
+            )
+            chunks = splitter.split_documents(documents=documents)
 
-        print(f"切分出 {len(chunks)} 个文本块")
+            print(f"切分出 {len(chunks)} 个文本块")
 
-        print("正在生成向量...")
-        embedded_chunks = embed_chunks(chunks)
+            print("正在生成向量...")
+            report("正在生成向量", 65)
+            embedded_chunks = embed_chunks(chunks)
 
         print("正在写入 Chroma 向量库...")
+        report("正在写入向量库", 85)
+        self.vector_store.delete_by_source(deleted_docs)
         self.vector_store.add(embedded_chunks)
+
+        print("正在更新文档状态列表...")
+        update_doc_status_list(
+            collection_name=self.vector_store.collection_name,
+            documents=documents,
+            deleted_docs=deleted_docs,
+            replace_all=force_full_scan,
+        )
+        print("文档状态列表更新完成")
 
         print("索引构建完成")
         print(f"当前索引包含 {self.vector_store.count()} 个文本块")
+        report("索引构建完成", 100)
 
     def ask(
         self, query: str, top_k: int = 3, score_threshold: float | None = None

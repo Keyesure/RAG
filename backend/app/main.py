@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 import sys
 import json
-from typing import Optional
+import queue
+import threading
+from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -25,6 +28,11 @@ rag = SimpleRAG()
 class BuildIndexRequest(BaseModel):
     data_dir: str = Field(..., description="知识库目录路径")
     force_rebuild: bool = Field(False, description="是否强制重建索引")
+    incremental: bool = Field(True, description="是否执行增量更新")
+    strategy: Literal["simple", "recursive"] = Field(
+        "simple",
+        description="切分策略，可选 simple / recursive",
+    )
 
 
 class AskRequest(BaseModel):
@@ -45,11 +53,21 @@ def health() -> dict:
 
 @app.post("/index")
 def build_index(payload: BuildIndexRequest) -> dict:
+    global rag
     try:
-        rag.build_index(data_dir=payload.data_dir, force_rebuild=payload.force_rebuild)
+        # 按前端选择的策略重建/构建对应的向量库实例
+        rag = SimpleRAG(strategy=payload.strategy)
+        rag.build_index(
+            data_dir=payload.data_dir,
+            force_rebuild=payload.force_rebuild,
+            incremental=payload.incremental,
+        )
         return {
             "message": "索引构建完成",
             "indexed_chunks": rag.vector_store.count(),
+            "strategy": payload.strategy,
+            "incremental": payload.incremental,
+            "force_rebuild": payload.force_rebuild,
         }
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -57,6 +75,58 @@ def build_index(payload: BuildIndexRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"构建索引失败: {exc}") from exc
+
+
+@app.post("/index/stream")
+async def build_index_stream(payload: BuildIndexRequest) -> StreamingResponse:
+    def sse_event(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    async def event_generator():
+        global rag
+        q: queue.Queue[dict] = queue.Queue()
+
+        def worker():
+            global rag
+            nonlocal q
+            try:
+                rag = SimpleRAG(strategy=payload.strategy)
+
+                def on_progress(stage: str, progress: int) -> None:
+                    q.put({"event": "progress", "data": {"stage": stage, "progress": progress}})
+
+                rag.build_index(
+                    data_dir=payload.data_dir,
+                    force_rebuild=payload.force_rebuild,
+                    incremental=payload.incremental,
+                    progress_callback=on_progress,
+                )
+                q.put(
+                    {
+                        "event": "done",
+                        "data": {
+                            "message": "索引构建完成",
+                            "indexed_chunks": rag.vector_store.count(),
+                            "strategy": payload.strategy,
+                            "incremental": payload.incremental,
+                            "force_rebuild": payload.force_rebuild,
+                        },
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                q.put({"event": "error", "data": {"message": f"构建索引失败: {exc}"}})
+            finally:
+                q.put({"event": "__close__", "data": {}})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        while True:
+            item = await asyncio.to_thread(q.get)
+            if item["event"] == "__close__":
+                break
+            yield sse_event(item["event"], item["data"])
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream; charset=utf-8")
 
 
 @app.post("/ask")

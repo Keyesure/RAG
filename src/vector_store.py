@@ -2,6 +2,8 @@
 # 使用 Chroma 实现本地持久化向量库。
 
 from pathlib import Path
+from datetime import datetime
+from typing import Any
 
 import chromadb
 import numpy as np
@@ -9,6 +11,7 @@ import numpy as np
 BATCH_SIZE = 1000
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PERSIST_DIR = PROJECT_ROOT / "storage" / "chroma"
+DEFAULT_COLLECTION_REGISTRY = PROJECT_ROOT / "storage" / "collections.md"
 
 
 class ChromaVectorStore:
@@ -26,17 +29,78 @@ class ChromaVectorStore:
         self,
         persist_dir: str = str(DEFAULT_PERSIST_DIR),
         collection_name: str = "rag_chunks",
+        collection_meta: dict[str, Any] | None = None,
+        registry_path: str | Path = DEFAULT_COLLECTION_REGISTRY,
     ):
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.collection_name = collection_name
+        self.registry_path = Path(registry_path)
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 初始化 Chroma 客户端，并获取或创建 collection。
         self.client = chromadb.PersistentClient(path=str(self.persist_dir))
-        # collection 是 Chroma 中存储向量数据的基本单位，我们在这里创建一个名为 "rag_chunks" 的 collection 来存储 RAG 相关的文本块和向量。
+        # collection 是 Chroma 中存储向量数据的基本单位
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
-            metadata={"description": "Simple RAG chunks collection"},
+            metadata=collection_meta
         )
+        self._register_collection(collection_meta=collection_meta)
+
+    def _register_collection(self, collection_meta: dict[str, Any] | None) -> None:
+        """
+        在 storage/collections.md 里登记 collection 信息。
+        若该 collection_name 已存在，则不重复追加。
+        """
+        if not self.registry_path.exists():
+            self.registry_path.write_text(
+                (
+                    "# Collections Registry\n\n"
+                    "| collection_name | persist_dir | created_at | status | metadata |\n"
+                    "|---|---|---|---|---|\n"
+                ),
+                encoding="utf-8",
+            )
+
+        content = self.registry_path.read_text(encoding="utf-8")
+        marker = f"| {self.collection_name} |"
+        if marker in content:
+            return
+
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        metadata_text = str(collection_meta or {}).replace("\n", " ")
+        row = (
+            f"| {self.collection_name} | {self.persist_dir} | "
+            f"{created_at} | initialized | `{metadata_text}` |\n"
+        )
+        with self.registry_path.open("a", encoding="utf-8") as f:
+            f.write(row)
+
+    def _mark_registry_active(self) -> None:
+        """
+        当 collection 已有实际数据后，把登记表状态改为 active。
+        """
+        if not self.registry_path.exists():
+            return
+
+        lines = self.registry_path.read_text(encoding="utf-8").splitlines()
+        target_prefix = f"| {self.collection_name} |"
+        updated = False
+        new_lines = []
+
+        for line in lines:
+            if line.startswith(target_prefix):
+                parts = line.split("|")
+                # 目标行格式:
+                # | name | persist | created_at | status | metadata |
+                if len(parts) >= 7:
+                    parts[4] = " active "
+                    line = "|".join(parts)
+                    updated = True
+            new_lines.append(line)
+
+        if updated:
+            self.registry_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
     def add(self, embedded_chunks: list[dict]):
 
@@ -87,11 +151,10 @@ class ChromaVectorStore:
 
             # upsert：如果 id 已存在就更新，不存在就新增。
             self.collection.upsert(
-                ids=ids, 
-                documents=documents, 
-                embeddings=embeddings, 
-                metadatas=metadatas
+                ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas
             )
+        if self.collection.count() > 0:
+            self._mark_registry_active()
 
     def similarity_search(
         self,
@@ -124,9 +187,16 @@ class ChromaVectorStore:
 
         output = []
 
-        documents = results["documents"][0]
-        metadatas = results["metadatas"][0]
-        distances = results["distances"][0]
+        documents_list = results.get("documents") or []
+        metadatas_list = results.get("metadatas") or []
+        distances_list = results.get("distances") or []
+
+        if not documents_list or not metadatas_list or not distances_list:
+            return []
+
+        documents = documents_list[0] or []
+        metadatas = metadatas_list[0] or []
+        distances = distances_list[0] or []
 
         for document, metadata, distance in zip(documents, metadatas, distances):
             distance = float(distance)
@@ -158,6 +228,15 @@ class ChromaVectorStore:
         if ids:
             self.collection.delete(ids=ids)
 
+    def delete_by_source(self, sources: list[str]):
+        """
+        按 source 批量删除文档块。
+        """
+        if not sources:
+            return
+        for source in sources:
+            self.collection.delete(where={"source": source})
+
     def is_empty(self) -> bool:
         """
         判断向量库是否为空。
@@ -169,3 +248,8 @@ class ChromaVectorStore:
         返回 collection 中的 chunk 数量。
         """
         return self.collection.count()
+    
+    def update_collection_metadata(self, metadata: dict[str, Any]):
+        current_metadata = self.collection.metadata or {}
+        new_metadata = current_metadata | metadata
+        self.collection.modify(metadata=new_metadata)

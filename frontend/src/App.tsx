@@ -11,6 +11,9 @@ type AskPayload = {
 type BuildIndexResponse = {
   message: string
   indexed_chunks: number
+  strategy?: 'simple' | 'recursive'
+  incremental?: boolean
+  force_rebuild?: boolean
 }
 
 type HealthResponse = {
@@ -42,7 +45,9 @@ const API_PREFIX = '/api'
 
 function App() {
   const [dataDir, setDataDir] = useState('data')
+  const [strategy, setStrategy] = useState<'simple' | 'recursive'>('simple')
   const [forceRebuild, setForceRebuild] = useState(false)
+  const [incremental, setIncremental] = useState(true)
   const [topK, setTopK] = useState(3)
   const [scoreThreshold, setScoreThreshold] = useState('')
 
@@ -51,6 +56,8 @@ function App() {
   const [statusText, setStatusText] = useState('就绪')
   const [error, setError] = useState('')
   const [indexing, setIndexing] = useState(false)
+  const [indexProgress, setIndexProgress] = useState(0)
+  const [indexStage, setIndexStage] = useState('')
   const [sending, setSending] = useState(false)
   const [viewerOpen, setViewerOpen] = useState(false)
   const [selectedCitation, setSelectedCitation] = useState<CitationItem | null>(null)
@@ -167,22 +174,73 @@ function App() {
     event.preventDefault()
     clearBanner()
     setIndexing(true)
+    setIndexProgress(0)
+    setIndexStage('准备中')
 
     try {
-      const resp = await fetch(`${API_PREFIX}/index`, {
+      const resp = await fetch(`${API_PREFIX}/index/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data_dir: dataDir, force_rebuild: forceRebuild }),
+        body: JSON.stringify({
+          data_dir: dataDir,
+          force_rebuild: forceRebuild,
+          incremental,
+          strategy,
+        }),
       })
       if (!resp.ok) throw new Error(await readError(resp))
-      const data = (await resp.json()) as BuildIndexResponse
-      setHealth({ status: 'ok', indexed_chunks: data.indexed_chunks })
-      setStatusText(`${data.message}，chunks: ${data.indexed_chunks}`)
-      addMessage('system', `索引已更新：${data.indexed_chunks} chunks。`) 
+      if (!resp.body) throw new Error('索引流式响应为空')
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder('utf-8')
+      let sseBuffer = ''
+      let doneEvent: BuildIndexResponse | null = null
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        sseBuffer += decoder.decode(value, { stream: true })
+        const { events, rest } = parseSseEvents(sseBuffer)
+        sseBuffer = rest
+
+        for (const item of events) {
+          if (item.event === 'progress') {
+            const payload = item.data as { stage?: string; progress?: number }
+            const stage = payload.stage ?? '处理中'
+            const progress = Math.max(0, Math.min(100, Number(payload.progress ?? 0)))
+            setIndexStage(stage)
+            setIndexProgress(progress)
+            setStatusText(`索引构建中 ${progress}% · ${stage}`)
+          } else if (item.event === 'error') {
+            const payload = item.data as { message?: string }
+            throw new Error(payload.message || '构建索引失败')
+          } else if (item.event === 'done') {
+            doneEvent = item.data as BuildIndexResponse
+          }
+        }
+      }
+
+      if (!doneEvent) {
+        throw new Error('索引构建未正常完成')
+      }
+
+      setIndexProgress(100)
+      setIndexStage('索引构建完成')
+      setHealth({ status: 'ok', indexed_chunks: doneEvent.indexed_chunks })
+      const activeStrategy = doneEvent.strategy ?? strategy
+      const modeText = doneEvent.force_rebuild
+        ? '全量重建'
+        : (doneEvent.incremental ?? incremental)
+          ? '增量更新'
+          : '仅复用'
+      setStatusText(`${doneEvent.message}，模式: ${modeText}，策略: ${activeStrategy}，chunks: ${doneEvent.indexed_chunks}`)
+      addMessage('system', `索引已更新：${modeText} · 策略 ${activeStrategy} · ${doneEvent.indexed_chunks} chunks。`)
     } catch (err) {
       const msg = err instanceof Error ? err.message : '构建索引失败'
       setError(msg)
       setStatusText('索引失败')
+      setIndexStage('索引失败')
     } finally {
       setIndexing(false)
     }
@@ -287,18 +345,41 @@ function App() {
               <input value={dataDir} onChange={(e) => setDataDir(e.target.value)} placeholder="data" />
             </label>
 
+            <label>
+              重建策略
+              <select value={strategy} onChange={(e) => setStrategy(e.target.value as 'simple' | 'recursive')}>
+                <option value="simple">simple</option>
+                <option value="recursive">recursive</option>
+              </select>
+            </label>
+
             <label className="check">
               <input
                 type="checkbox"
                 checked={forceRebuild}
                 onChange={(e) => setForceRebuild(e.target.checked)}
               />
-              强制重建索引
+              强制重建（清空后全量构建）
+            </label>
+
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={incremental}
+                onChange={(e) => setIncremental(e.target.checked)}
+                disabled={forceRebuild}
+              />
+              增量更新（关闭时仅复用已有索引）
             </label>
 
             <button type="submit" disabled={indexing}>
-              {indexing ? '构建中...' : '构建索引'}
+              {indexing ? '执行中...' : '执行索引'}
             </button>
+            <label>
+              重建进度
+              <progress value={indexProgress} max={100} />
+              <span>{indexProgress}% {indexStage ? `· ${indexStage}` : ''}</span>
+            </label>
           </form>
 
           <div className="stack">
