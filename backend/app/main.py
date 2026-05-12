@@ -15,7 +15,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from rag import SimpleRAG  # noqa: E402
+from src.rag import SimpleRAG  # noqa: E402
 
 
 app = FastAPI(title="Simple RAG Backend", version="1.0.0")
