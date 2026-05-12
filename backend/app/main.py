@@ -105,7 +105,7 @@ async def ask_stream(payload: AskRequest) -> StreamingResponse:
             yield sse_event("error", {"message": f"问答失败: {exc}"})
             yield sse_event("done", {})
 
-    return StreamingResponse(token_generator(), media_type="text/plain; charset=utf-8")
+    return StreamingResponse(token_generator(), media_type="text/event-stream; charset=utf-8")
 
 
 @app.get("/overview")
@@ -118,18 +118,28 @@ def overview() -> dict:
     - documents: 文档清单（source + content_hash）
     """
     try:
-        documents = load_doc_status_list()
-
         last_indexed_at = None
+        documents = []
         if not rag.vector_store.is_empty():
             existing = rag.vector_store.collection.get(include=["metadatas"])
             timestamps = []
+            sources_seen = set()
             for metadata in existing.get("metadatas", []):
                 if isinstance(metadata, dict) and metadata.get("updated_at"):
                     try:
                         timestamps.append(float(metadata["updated_at"]))
                     except (ValueError, TypeError):
                         continue
+                if isinstance(metadata, dict) and metadata.get("source"):
+                    source = metadata["source"]
+                    if source not in sources_seen:
+                        sources_seen.add(source)
+                        documents.append(
+                            {
+                                "source": source,
+                                "content_hash": metadata.get("content_hash", ""),
+                            }
+                        )
             if timestamps:
                 last_indexed_at = max(timestamps)
 

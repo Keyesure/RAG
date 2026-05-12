@@ -14,6 +14,8 @@ from typing import Iterator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PERSIST_DIR = PROJECT_ROOT / "storage" / "chroma"
+DEFAULT_DATA_DIR = "data"
+DEFAULT_COLLECTION_NAME = "rag_chunks"
 
 
 class SimpleRAG:
@@ -47,9 +49,9 @@ class SimpleRAG:
 
 
         print("正在读取文档...")
-        documents, deleted_docs = load_documents_from_dir(data_dir)
+        documents = load_documents_from_dir(data_dir)
         
-        if not documents and not deleted_docs:
+        if not documents:
             print("没有新的文档需要处理。")
             return
 
@@ -65,10 +67,6 @@ class SimpleRAG:
 
         print("正在写入 Chroma 向量库...")
         self.vector_store.add(embedded_chunks)
-        
-        print("正在更新文档状态列表...")
-        update_doc_status_list(documents, deleted_docs)
-        print("文档状态列表更新完成")
 
         print("索引构建完成")
         print(f"当前索引包含 {self.vector_store.count()} 个文本块")

@@ -18,11 +18,9 @@ type HealthResponse = {
   indexed_chunks: number
 }
 
-type ChatRole = 'user' | 'assistant' | 'system'
-
 type ChatMessage = {
   id: string
-  role: ChatRole
+  role: 'user' | 'assistant' | 'system'
   content: string
   pending?: boolean
   citations?: CitationItem[]
@@ -54,9 +52,8 @@ function App() {
   const [error, setError] = useState('')
   const [indexing, setIndexing] = useState(false)
   const [sending, setSending] = useState(false)
-  const [overview, setOverview] = useState<OverviewResponse | null>(null)
-  const [overviewLoading, setOverviewLoading] = useState(false)
-  const [docKeyword, setDocKeyword] = useState('')
+  const [viewerOpen, setViewerOpen] = useState(false)
+  const [selectedCitation, setSelectedCitation] = useState<CitationItem | null>(null)
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -70,7 +67,7 @@ function App() {
 
   const canSend = useMemo(() => input.trim().length > 0 && !sending, [input, sending])
 
-  const addMessage = (role: ChatRole, content: string, pending = false): string => {
+  const addMessage = (role: 'user' | 'assistant' | 'system', content: string, pending = false): string => {
     const id = crypto.randomUUID()
     setMessages((prev) => [...prev, { id, role, content, pending }])
     queueMicrotask(() => {

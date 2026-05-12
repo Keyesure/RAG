@@ -1,5 +1,6 @@
 # llm.py 负责根据用户问题和检索到的相关文档块生成最终回答，目前使用一个简单的字符串拼接来模拟回答生成，后续可以替换成真正的 LLM 调用。
 
+import os
 import requests
 import json
 from typing import Iterator
@@ -41,7 +42,7 @@ def generate_answer_with_ollama_stream(
 
     try:
         response = requests.post(
-            "http://localhost:11434/api/generate",
+            OLLAMA_GENERATE_URL,
             json={
                 "model": model,
                 "prompt": prompt,
@@ -68,10 +69,11 @@ def generate_answer_with_ollama_stream(
                 break
 
     except requests.exceptions.RequestException as exc:
-        yield {
-            "event": "token",
-            "data": f"调用本地 LLM 服务失败。请确认 Ollama 已启动，并且模型名称配置正确。\n错误详情: {exc}",
-        }
+        yield (
+            "调用本地 LLM 服务失败。请确认 Ollama 已启动，"
+            "并且模型名称配置正确。"
+            f"\n错误详情: {exc}"
+        )
 
 
 def generate_answer(query: str, contexts: list[dict], model: str = DEFAULT_LLM_MODEL) -> str:
