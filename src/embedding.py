@@ -4,6 +4,7 @@
 
 import requests
 import numpy as np
+from typing import Callable
 
 
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embed"
@@ -46,7 +47,9 @@ def text_to_embedding(
 # embed_chunks 函数给每个 chunk 增加 embedding 字段，返回一个新的列表，每个元素都是一个包含原始 chunk 信息和对应 embedding 的字典。
 def embed_chunks(
     chunks: list[dict],
-    model: str = DEFAULT_EMBEDDING_MODEL
+    model: str = DEFAULT_EMBEDDING_MODEL,
+    should_stop: Callable[[], bool] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[dict]:
     """
     给每个 chunk 增加 embedding 字段。
@@ -60,10 +63,14 @@ def embed_chunks(
     并将原始 chunk 信息和 embedding 一起存储在一个新的字典中，最后返回一个包含所有这些字典的列表。
     """
     for index, chunk in enumerate(chunks):
+        if should_stop is not None and should_stop():
+            raise InterruptedError("索引任务已被停止")
         print(f"正在向量化 chunk {index + 1}/{len(chunks)}")
 
         item = chunk.copy()
         item["embedding"] = text_to_embedding(chunk["text"], model=model)
         embedded_chunks.append(item)
+        if progress_callback is not None:
+            progress_callback(index + 1, len(chunks))
 
     return embedded_chunks

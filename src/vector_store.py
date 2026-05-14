@@ -4,7 +4,7 @@
 from pathlib import Path
 from datetime import datetime
 from typing import Any
-
+from embedding import text_to_embedding
 import chromadb
 import numpy as np
 
@@ -42,8 +42,7 @@ class ChromaVectorStore:
         self.client = chromadb.PersistentClient(path=str(self.persist_dir))
         # collection 是 Chroma 中存储向量数据的基本单位
         self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata=collection_meta
+            name=collection_name, metadata=collection_meta
         )
         self._register_collection(collection_meta=collection_meta)
 
@@ -156,9 +155,12 @@ class ChromaVectorStore:
         if self.collection.count() > 0:
             self._mark_registry_active()
 
+
+
+    # ____________________________简单相似度检索_______________________________________
     def similarity_search(
         self,
-        query_embedding: np.ndarray,
+        query: str,
         top_k: int = 3,
         score_threshold: float | None = None,
     ) -> list[dict]:
@@ -176,9 +178,9 @@ class ChromaVectorStore:
         """
         if self.is_empty():
             return []
-
+        query_embedding = text_to_embedding(query)
         query_embedding = np.asarray(query_embedding, dtype=np.float32).tolist()
-
+        # _______________________检索主入口_______________________________ 
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
@@ -187,6 +189,7 @@ class ChromaVectorStore:
 
         output = []
 
+        # ______________________解析结果________________________________
         documents_list = results.get("documents") or []
         metadatas_list = results.get("metadatas") or []
         distances_list = results.get("distances") or []
@@ -216,6 +219,8 @@ class ChromaVectorStore:
             )
 
         return output
+
+    # __________________________________________________________________________________
 
     def clear(self):
         """
@@ -248,7 +253,7 @@ class ChromaVectorStore:
         返回 collection 中的 chunk 数量。
         """
         return self.collection.count()
-    
+
     def update_collection_metadata(self, metadata: dict[str, Any]):
         current_metadata = self.collection.metadata or {}
         new_metadata = current_metadata | metadata

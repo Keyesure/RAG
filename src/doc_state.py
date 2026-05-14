@@ -10,14 +10,43 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOC_STATUS_DIR = Path(
     os.getenv("DOC_STATUS_DIR", str(PROJECT_ROOT / "storage" / "doc_status"))
 )
-LEGACY_DOC_STATUS_LIST_PATH = Path(
-    os.getenv("DOC_STATUS_LIST_PATH", str(PROJECT_ROOT / "storage" / "doc_status_list.json"))
-)
+
+
+def _normalize_doc_status_list(items: list[dict]) -> list[dict]:
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("source")
+        content_hash = item.get("content_hash")
+        if not source or not content_hash:
+            continue
+        normalized.append(
+            {
+                "source": str(Path(source).resolve()),
+                "content_hash": content_hash,
+            }
+        )
+    return normalized
+
+
+def _read_json_list(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return _normalize_doc_status_list(data)
+
 
 def _get_doc_status_list_path(collection_name: str) -> Path:
     DOC_STATUS_DIR.mkdir(parents=True, exist_ok=True)
     safe_name = collection_name.replace("/", "_")
     return DOC_STATUS_DIR / f"{safe_name}.json"
+
 
 def load_doc_status_list(collection_name: str) -> list[dict]:
     """
@@ -25,13 +54,7 @@ def load_doc_status_list(collection_name: str) -> list[dict]:
     每个文档状态包含 source、content_hash、last_updated 等信息。
     """
     path = _get_doc_status_list_path(collection_name)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    # 兼容旧单文件状态表：仅在新分表不存在时回退读取。
-    if LEGACY_DOC_STATUS_LIST_PATH.exists():
-        return json.loads(LEGACY_DOC_STATUS_LIST_PATH.read_text(encoding="utf-8"))
-    return []
+    return _read_json_list(path)
 
 def update_doc_status_list(
     collection_name: str,
@@ -52,7 +75,7 @@ def update_doc_status_list(
         for item in documents:
             # 状态表只保留用于增量判断的字段，避免把全文写入 JSON。
             new_list.append({
-                "source": item["source"],
+                "source": str(Path(item["source"]).resolve()),
                 "content_hash": item["content_hash"],
             })
         save_doc_status_list(collection_name, new_list)

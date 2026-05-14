@@ -56,7 +56,7 @@ def load_documents_from_dir(
         }
     ]
     """
-    path = Path(data_dir)
+    path = Path(data_dir).resolve()
 
     if not path.exists():
         raise FileNotFoundError(f"目录不存在: {data_dir}")
@@ -65,34 +65,44 @@ def load_documents_from_dir(
     current_docs = []
     deleted_docs = []
     doc_status_list = [] if force_full_scan else load_doc_status_list(collection_name)
-    old_doc_sources = {item["source"]: item["content_hash"] for item in doc_status_list}
+
+    def normalize_source(source: str) -> str:
+        return str(Path(source).resolve())
+
+    old_doc_sources = {
+        normalize_source(item["source"]): item["content_hash"]
+        for item in doc_status_list
+        if isinstance(item, dict) and item.get("source") and item.get("content_hash")
+    }
     # 遍历目录下的所有文件，如果是 txt 或 md 文件，则读取并添加到结果
     for file in path.rglob("*"):
         if file.suffix.lower() in [".txt", ".md"]:
-            content_hash_value = content_hash(str(file))
+            normalized_source = str(file.resolve())
+            content_hash_value = content_hash(normalized_source)
             # 按文件名查找文件是否已存在
-            if str(file) in old_doc_sources:
+            if normalized_source in old_doc_sources:
                 # 文件已存在,比较哈希
-                if content_hash_value == old_doc_sources[str(file)]:
+                if content_hash_value == old_doc_sources[normalized_source]:
                     print(f"文件未修改，跳过: {file}")
-                    current_docs.append(str(file))
+                    current_docs.append(normalized_source)
                     continue
                 else:
                     # 文件已修改,删除旧状态，添加新状态
-                    deleted_docs.append(str(file))
+                    deleted_docs.append(normalized_source)
                     
                     
             # 文件新添加或已修改，更新状态列表 
             documents.append({
-                "source": str(file),
+                "source": normalized_source,
                 "text": file.read_text(encoding="utf-8"),
                 "content_hash": content_hash_value,
             })
     # 标记已删除的文档
     new_sources= [doc["source"] for doc in documents]
     for item in doc_status_list:
-        if item["source"] not in current_docs and item["source"] not in new_sources:
-            deleted_docs.append(item["source"])
+        old_source = normalize_source(item["source"])
+        if old_source not in current_docs and old_source not in new_sources:
+            deleted_docs.append(old_source)
             
             
     deleted_docs = list(dict.fromkeys(deleted_docs))        

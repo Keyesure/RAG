@@ -1,10 +1,12 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import './App.css'
 
 type AskPayload = {
   query: string
   top_k: number
+  strategy: 'simple' | 'recursive'
+  retrieve_strategy: 'simple' | 'hybrid' | 'hybrid_rrk'
   score_threshold: number | null
 }
 
@@ -14,10 +16,12 @@ type BuildIndexResponse = {
   strategy?: 'simple' | 'recursive'
   incremental?: boolean
   force_rebuild?: boolean
+  stopped?: boolean
 }
 
 type HealthResponse = {
   status: string
+  strategy?: 'simple' | 'recursive'
   indexed_chunks: number
 }
 
@@ -49,6 +53,7 @@ function App() {
   const [forceRebuild, setForceRebuild] = useState(false)
   const [incremental, setIncremental] = useState(true)
   const [topK, setTopK] = useState(3)
+  const [retrieveStrategy, setRetrieveStrategy] = useState<'simple' | 'hybrid' | 'hybrid_rrk'>('simple')
   const [scoreThreshold, setScoreThreshold] = useState('')
 
   const [input, setInput] = useState('')
@@ -138,6 +143,8 @@ function App() {
   const makeAskPayload = (query: string): AskPayload => ({
     query,
     top_k: topK,
+    strategy,
+    retrieve_strategy: retrieveStrategy,
     score_threshold: parseThreshold(),
   })
 
@@ -158,17 +165,22 @@ function App() {
   const checkHealth = async () => {
     clearBanner()
     try {
-      const resp = await fetch(`${API_PREFIX}/health`)
+      const resp = await fetch(`${API_PREFIX}/health?strategy=${strategy}`)
       if (!resp.ok) throw new Error(await readError(resp))
       const data = (await resp.json()) as HealthResponse
       setHealth(data)
-      setStatusText(`后端在线，索引 chunks: ${data.indexed_chunks}`)
+      const activeStrategy = data.strategy ?? strategy
+      setStatusText(`后端在线，策略: ${activeStrategy}，索引 chunks: ${data.indexed_chunks}`)
     } catch (err) {
       const msg = err instanceof Error ? err.message : '健康检查失败'
       setError(msg)
       setStatusText('检查失败')
     }
   }
+
+  useEffect(() => {
+    void checkHealth()
+  }, [strategy])
 
   const buildIndex = async (event: FormEvent) => {
     event.preventDefault()
@@ -195,6 +207,7 @@ function App() {
       const decoder = new TextDecoder('utf-8')
       let sseBuffer = ''
       let doneEvent: BuildIndexResponse | null = null
+      let stoppedEvent: BuildIndexResponse | null = null
 
       while (true) {
         const { done, value } = await reader.read()
@@ -217,8 +230,18 @@ function App() {
             throw new Error(payload.message || '构建索引失败')
           } else if (item.event === 'done') {
             doneEvent = item.data as BuildIndexResponse
+          } else if (item.event === 'stopped') {
+            stoppedEvent = item.data as BuildIndexResponse
           }
         }
+      }
+
+      if (stoppedEvent) {
+        setIndexStage('索引已停止')
+        setStatusText(stoppedEvent.message || '索引任务已停止')
+        setHealth({ status: 'ok', indexed_chunks: stoppedEvent.indexed_chunks })
+        addMessage('system', `索引任务已停止，当前 chunks: ${stoppedEvent.indexed_chunks}。`)
+        return
       }
 
       if (!doneEvent) {
@@ -243,6 +266,25 @@ function App() {
       setIndexStage('索引失败')
     } finally {
       setIndexing(false)
+    }
+  }
+
+  const stopIndex = async () => {
+    clearBanner()
+    try {
+      const resp = await fetch(`${API_PREFIX}/index/stop`, {
+        method: 'POST',
+      })
+      if (!resp.ok) throw new Error(await readError(resp))
+      const data = (await resp.json()) as { message?: string; stopped?: boolean }
+      setStatusText(data.message || '已发送停止信号')
+      if (data.stopped) {
+        setIndexStage('停止中')
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '停止索引失败'
+      setError(msg)
+      setStatusText('停止索引失败')
     }
   }
 
@@ -337,7 +379,11 @@ function App() {
           <button type="button" className="ghost" onClick={checkHealth}>
             检查后端状态
           </button>
-          <p className="status">{health ? `在线 · chunks ${health.indexed_chunks}` : '未检查'}</p>
+          <p className="status">
+            {health
+              ? `在线 · ${health.strategy ?? strategy} · chunks ${health.indexed_chunks}`
+              : '未检查'}
+          </p>
 
           <form onSubmit={buildIndex} className="stack">
             <label>
@@ -346,7 +392,7 @@ function App() {
             </label>
 
             <label>
-              重建策略
+              切分策略
               <select value={strategy} onChange={(e) => setStrategy(e.target.value as 'simple' | 'recursive')}>
                 <option value="simple">simple</option>
                 <option value="recursive">recursive</option>
@@ -375,6 +421,9 @@ function App() {
             <button type="submit" disabled={indexing}>
               {indexing ? '执行中...' : '执行索引'}
             </button>
+            <button type="button" className="ghost" disabled={!indexing} onClick={stopIndex}>
+              停止索引
+            </button>
             <label>
               重建进度
               <progress value={indexProgress} max={100} />
@@ -383,6 +432,17 @@ function App() {
           </form>
 
           <div className="stack">
+            <label>
+              检索策略
+              <select
+                value={retrieveStrategy}
+                onChange={(e) => setRetrieveStrategy(e.target.value as 'simple' | 'hybrid' | 'hybrid_rrk')}
+              >
+                <option value="simple">simple（向量检索）</option>
+                <option value="hybrid">hybrid（向量+BM25）</option>
+                <option value="hybrid_rrk">hybrid_rrk（预留）</option>
+              </select>
+            </label>
             <label>
               top_k
               <input

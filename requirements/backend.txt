@@ -7,3 +7,5 @@ chromadb
 fastapi
 uvicorn
 sse-starlette
+jieba
+rank_bm25

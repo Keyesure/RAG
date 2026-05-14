@@ -55,11 +55,13 @@ def generate_answer_with_ollama_stream(
         )
         response.raise_for_status()
 
-        for line in response.iter_lines():
+        # requests.iter_lines 默认 chunk_size=512，短文本场景容易积压后一次性返回，
+        # 这里改为更小缓冲，提升浏览器端流式观感。
+        for line in response.iter_lines(chunk_size=1, decode_unicode=True):
             if not line:
                 continue
 
-            data = json.loads(line.decode("utf-8"))
+            data = json.loads(line)
 
             token = data.get("response", "")
             if token:
