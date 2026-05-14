@@ -1,21 +1,17 @@
 # vector_store.py
 # 使用 Chroma 实现本地持久化向量库。
 
-import os
 from pathlib import Path
-import datetime
+from datetime import datetime
+from typing import Any
+from embedding import text_to_embedding
 import chromadb
 import numpy as np
-from dotenv import load_dotenv
-
-load_dotenv()
 
 BATCH_SIZE = 1000
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_PERSIST_DIR = Path(
-    os.getenv("CHROMA_PERSIST_DIR", str(PROJECT_ROOT / "storage" / "chroma"))
-)
-DEFAULT_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "rag_chunks")
+DEFAULT_PERSIST_DIR = PROJECT_ROOT / "storage" / "chroma"
+DEFAULT_COLLECTION_REGISTRY = PROJECT_ROOT / "storage" / "collections.md"
 
 
 class ChromaVectorStore:
@@ -32,18 +28,78 @@ class ChromaVectorStore:
     def __init__(
         self,
         persist_dir: str = str(DEFAULT_PERSIST_DIR),
-        collection_name: str = DEFAULT_COLLECTION_NAME,
+        collection_name: str = "rag_chunks",
+        collection_meta: dict[str, Any] | None = None,
+        registry_path: str | Path = DEFAULT_COLLECTION_REGISTRY,
     ):
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.collection_name = collection_name
+        self.registry_path = Path(registry_path)
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 初始化 Chroma 客户端，并获取或创建 collection。
         self.client = chromadb.PersistentClient(path=str(self.persist_dir))
-        # collection 是 Chroma 中存储向量数据的基本单位，我们在这里创建一个名为 "rag_chunks" 的 collection 来存储 RAG 相关的文本块和向量。
+        # collection 是 Chroma 中存储向量数据的基本单位
         self.collection = self.client.get_or_create_collection(
-            name=collection_name,
-            metadata={"description": "Simple RAG chunks collection"},
+            name=collection_name, metadata=collection_meta
         )
+        self._register_collection(collection_meta=collection_meta)
+
+    def _register_collection(self, collection_meta: dict[str, Any] | None) -> None:
+        """
+        在 storage/collections.md 里登记 collection 信息。
+        若该 collection_name 已存在，则不重复追加。
+        """
+        if not self.registry_path.exists():
+            self.registry_path.write_text(
+                (
+                    "# Collections Registry\n\n"
+                    "| collection_name | persist_dir | created_at | status | metadata |\n"
+                    "|---|---|---|---|---|\n"
+                ),
+                encoding="utf-8",
+            )
+
+        content = self.registry_path.read_text(encoding="utf-8")
+        marker = f"| {self.collection_name} |"
+        if marker in content:
+            return
+
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        metadata_text = str(collection_meta or {}).replace("\n", " ")
+        row = (
+            f"| {self.collection_name} | {self.persist_dir} | "
+            f"{created_at} | initialized | `{metadata_text}` |\n"
+        )
+        with self.registry_path.open("a", encoding="utf-8") as f:
+            f.write(row)
+
+    def _mark_registry_active(self) -> None:
+        """
+        当 collection 已有实际数据后，把登记表状态改为 active。
+        """
+        if not self.registry_path.exists():
+            return
+
+        lines = self.registry_path.read_text(encoding="utf-8").splitlines()
+        target_prefix = f"| {self.collection_name} |"
+        updated = False
+        new_lines = []
+
+        for line in lines:
+            if line.startswith(target_prefix):
+                parts = line.split("|")
+                # 目标行格式:
+                # | name | persist | created_at | status | metadata |
+                if len(parts) >= 7:
+                    parts[4] = " active "
+                    line = "|".join(parts)
+                    updated = True
+            new_lines.append(line)
+
+        if updated:
+            self.registry_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
     def add(self, embedded_chunks: list[dict]):
 
@@ -55,18 +111,18 @@ class ChromaVectorStore:
         # 分批次添加，避免一次性插入过多数据导致内存问题。
         for start in range(0, total, BATCH_SIZE):
             # 取出当前批次的数据。
-            batch = embedded_chunks[start: start + BATCH_SIZE]
+            batch = embedded_chunks[start : start + BATCH_SIZE]
             """
-            embeded_chunks 的每个 item 包含
+            embeded_chunks 的每个 item 包含 
             source、
             chunk_id、
             text、
-            embedding
-            四个字段，我们需要将它们分别提取出来，准备好
+            embedding 
+            四个字段，我们需要将它们分别提取出来，准备好 
             ids、
             doctcuments、
             embeddings、
-            metadatas
+            metadatas 
             四个列表，以便后续调用 collection.upsert() 方法进行批量插入或更新。
             """
             ids = []
@@ -90,40 +146,21 @@ class ChromaVectorStore:
                     np.asarray(item["embedding"], dtype=np.float32).tolist()
                 )
                 # 元数据包含 source 和 chunk_id，这样我们在检索时就可以知道每个文档块的来源和位置。
-                metadata = {"source": source, "chunk_id": chunk_id, "updated_at": str(datetime.datetime.now().timestamp())}
-                if "content_hash" in item:
-                    metadata["content_hash"] = item["content_hash"]
-                metadatas.append(metadata)
+                metadatas.append({"source": source, "chunk_id": chunk_id})
 
             # upsert：如果 id 已存在就更新，不存在就新增。
             self.collection.upsert(
-                ids=ids,
-                documents=documents,
-                embeddings=embeddings,
-                metadatas=metadatas
+                ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas
             )
+        if self.collection.count() > 0:
+            self._mark_registry_active()
 
-    def delete_by_source(self, sources: list[str]):
-        """
-        根据 source 删除对应的 chunk。
-        """
-        if not sources:
-            return
 
-        existing = self.collection.get()
 
-        ids_to_delete = []
-
-        for doc_id, metadata in zip(existing.get("ids", []), existing.get("metadatas", [])):
-            if metadata["source"] in sources:
-                ids_to_delete.append(doc_id)
-
-        if ids_to_delete:
-            self.collection.delete(ids=ids_to_delete)
-
+    # ____________________________简单相似度检索_______________________________________
     def similarity_search(
         self,
-        query_embedding: np.ndarray,
+        query: str,
         top_k: int = 3,
         score_threshold: float | None = None,
     ) -> list[dict]:
@@ -141,9 +178,9 @@ class ChromaVectorStore:
         """
         if self.is_empty():
             return []
-
+        query_embedding = text_to_embedding(query)
         query_embedding = np.asarray(query_embedding, dtype=np.float32).tolist()
-
+        # _______________________检索主入口_______________________________ 
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
@@ -152,9 +189,17 @@ class ChromaVectorStore:
 
         output = []
 
-        documents = results["documents"][0]
-        metadatas = results["metadatas"][0]
-        distances = results["distances"][0]
+        # ______________________解析结果________________________________
+        documents_list = results.get("documents") or []
+        metadatas_list = results.get("metadatas") or []
+        distances_list = results.get("distances") or []
+
+        if not documents_list or not metadatas_list or not distances_list:
+            return []
+
+        documents = documents_list[0] or []
+        metadatas = metadatas_list[0] or []
+        distances = distances_list[0] or []
 
         for document, metadata, distance in zip(documents, metadatas, distances):
             distance = float(distance)
@@ -175,6 +220,8 @@ class ChromaVectorStore:
 
         return output
 
+    # __________________________________________________________________________________
+
     def clear(self):
         """
         清空当前 collection。
@@ -185,6 +232,15 @@ class ChromaVectorStore:
 
         if ids:
             self.collection.delete(ids=ids)
+
+    def delete_by_source(self, sources: list[str]):
+        """
+        按 source 批量删除文档块。
+        """
+        if not sources:
+            return
+        for source in sources:
+            self.collection.delete(where={"source": source})
 
     def is_empty(self) -> bool:
         """
@@ -197,3 +253,8 @@ class ChromaVectorStore:
         返回 collection 中的 chunk 数量。
         """
         return self.collection.count()
+
+    def update_collection_metadata(self, metadata: dict[str, Any]):
+        current_metadata = self.collection.metadata or {}
+        new_metadata = current_metadata | metadata
+        self.collection.modify(metadata=new_metadata)

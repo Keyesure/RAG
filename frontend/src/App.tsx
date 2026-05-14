@@ -1,50 +1,59 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import './App.css'
 
 type AskPayload = {
   query: string
   top_k: number
+  strategy: 'simple' | 'recursive'
+  retrieve_strategy: 'simple' | 'hybrid' | 'hybrid_rrk'
   score_threshold: number | null
 }
 
 type BuildIndexResponse = {
   message: string
   indexed_chunks: number
+  strategy?: 'simple' | 'recursive'
+  incremental?: boolean
+  force_rebuild?: boolean
+  stopped?: boolean
 }
 
 type HealthResponse = {
   status: string
+  strategy?: 'simple' | 'recursive'
   indexed_chunks: number
 }
-
-type OverviewDocument = {
-  source: string
-  content_hash: string
-}
-
-type OverviewResponse = {
-  tracked_documents: number
-  indexed_chunks: number
-  last_indexed_at: number | null
-  documents: OverviewDocument[]
-}
-
-type ChatRole = 'user' | 'assistant' | 'system'
 
 type ChatMessage = {
   id: string
-  role: ChatRole
+  role: 'user' | 'assistant' | 'system'
   content: string
   pending?: boolean
+  citations?: CitationItem[]
+}
+
+type CitationItem = {
+  source: string
+  chunk_id: number
+  text: string
+  score: number
+}
+
+type SseEnvelope = {
+  event: string
+  data: unknown
 }
 
 const API_PREFIX = '/api'
 
 function App() {
   const [dataDir, setDataDir] = useState('data')
+  const [strategy, setStrategy] = useState<'simple' | 'recursive'>('simple')
   const [forceRebuild, setForceRebuild] = useState(false)
+  const [incremental, setIncremental] = useState(true)
   const [topK, setTopK] = useState(3)
+  const [retrieveStrategy, setRetrieveStrategy] = useState<'simple' | 'hybrid' | 'hybrid_rrk'>('simple')
   const [scoreThreshold, setScoreThreshold] = useState('')
 
   const [input, setInput] = useState('')
@@ -52,10 +61,11 @@ function App() {
   const [statusText, setStatusText] = useState('就绪')
   const [error, setError] = useState('')
   const [indexing, setIndexing] = useState(false)
+  const [indexProgress, setIndexProgress] = useState(0)
+  const [indexStage, setIndexStage] = useState('')
   const [sending, setSending] = useState(false)
-  const [overview, setOverview] = useState<OverviewResponse | null>(null)
-  const [overviewLoading, setOverviewLoading] = useState(false)
-  const [docKeyword, setDocKeyword] = useState('')
+  const [viewerOpen, setViewerOpen] = useState(false)
+  const [selectedCitation, setSelectedCitation] = useState<CitationItem | null>(null)
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -68,14 +78,8 @@ function App() {
   const chatBodyRef = useRef<HTMLDivElement | null>(null)
 
   const canSend = useMemo(() => input.trim().length > 0 && !sending, [input, sending])
-  const filteredDocs = useMemo(() => {
-    if (!overview) return []
-    const keyword = docKeyword.trim().toLowerCase()
-    if (!keyword) return overview.documents
-    return overview.documents.filter((item) => item.source.toLowerCase().includes(keyword))
-  }, [overview, docKeyword])
 
-  const addMessage = (role: ChatRole, content: string, pending = false): string => {
+  const addMessage = (role: 'user' | 'assistant' | 'system', content: string, pending = false): string => {
     const id = crypto.randomUUID()
     setMessages((prev) => [...prev, { id, role, content, pending }])
     queueMicrotask(() => {
@@ -86,6 +90,45 @@ function App() {
 
   const updateMessage = (id: string, patch: Partial<ChatMessage>) => {
     setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, ...patch } : m)))
+  }
+
+  const toDataRelativeSource = (source: string): string => {
+    const marker = 'data/'
+    const index = source.lastIndexOf(marker)
+    if (index >= 0) {
+      return source.slice(index)
+    }
+    return source
+  }
+
+  const parseSseEvents = (buffer: string): { events: SseEnvelope[]; rest: string } => {
+    const parts = buffer.split('\n\n')
+    const rest = parts.pop() ?? ''
+    const events: SseEnvelope[] = []
+
+    for (const block of parts) {
+      const lines = block.split('\n')
+      let eventName = ''
+      let dataText = ''
+
+      for (const line of lines) {
+        if (line.startsWith('event:')) {
+          eventName = line.slice(6).trim()
+        } else if (line.startsWith('data:')) {
+          dataText += line.slice(5).trim()
+        }
+      }
+
+      if (!eventName || !dataText) continue
+
+      try {
+        events.push({ event: eventName, data: JSON.parse(dataText) })
+      } catch {
+        continue
+      }
+    }
+
+    return { events, rest }
   }
 
   const parseThreshold = (): number | null => {
@@ -100,6 +143,8 @@ function App() {
   const makeAskPayload = (query: string): AskPayload => ({
     query,
     top_k: topK,
+    strategy,
+    retrieve_strategy: retrieveStrategy,
     score_threshold: parseThreshold(),
   })
 
@@ -120,11 +165,12 @@ function App() {
   const checkHealth = async () => {
     clearBanner()
     try {
-      const resp = await fetch(`${API_PREFIX}/health`)
+      const resp = await fetch(`${API_PREFIX}/health?strategy=${strategy}`)
       if (!resp.ok) throw new Error(await readError(resp))
       const data = (await resp.json()) as HealthResponse
       setHealth(data)
-      setStatusText(`后端在线，索引 chunks: ${data.indexed_chunks}`)
+      const activeStrategy = data.strategy ?? strategy
+      setStatusText(`后端在线，策略: ${activeStrategy}，索引 chunks: ${data.indexed_chunks}`)
     } catch (err) {
       const msg = err instanceof Error ? err.message : '健康检查失败'
       setError(msg)
@@ -132,47 +178,113 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    void checkHealth()
+  }, [strategy])
+
   const buildIndex = async (event: FormEvent) => {
     event.preventDefault()
     clearBanner()
     setIndexing(true)
+    setIndexProgress(0)
+    setIndexStage('准备中')
 
     try {
-      const resp = await fetch(`${API_PREFIX}/index`, {
+      const resp = await fetch(`${API_PREFIX}/index/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data_dir: dataDir, force_rebuild: forceRebuild }),
+        body: JSON.stringify({
+          data_dir: dataDir,
+          force_rebuild: forceRebuild,
+          incremental,
+          strategy,
+        }),
       })
       if (!resp.ok) throw new Error(await readError(resp))
-      const data = (await resp.json()) as BuildIndexResponse
-      setHealth({ status: 'ok', indexed_chunks: data.indexed_chunks })
-      setStatusText(`${data.message}，chunks: ${data.indexed_chunks}`)
-      addMessage('system', `索引已更新：${data.indexed_chunks} chunks。`) 
-      void fetchOverview()
+      if (!resp.body) throw new Error('索引流式响应为空')
+
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder('utf-8')
+      let sseBuffer = ''
+      let doneEvent: BuildIndexResponse | null = null
+      let stoppedEvent: BuildIndexResponse | null = null
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        sseBuffer += decoder.decode(value, { stream: true })
+        const { events, rest } = parseSseEvents(sseBuffer)
+        sseBuffer = rest
+
+        for (const item of events) {
+          if (item.event === 'progress') {
+            const payload = item.data as { stage?: string; progress?: number }
+            const stage = payload.stage ?? '处理中'
+            const progress = Math.max(0, Math.min(100, Number(payload.progress ?? 0)))
+            setIndexStage(stage)
+            setIndexProgress(progress)
+            setStatusText(`索引构建中 ${progress}% · ${stage}`)
+          } else if (item.event === 'error') {
+            const payload = item.data as { message?: string }
+            throw new Error(payload.message || '构建索引失败')
+          } else if (item.event === 'done') {
+            doneEvent = item.data as BuildIndexResponse
+          } else if (item.event === 'stopped') {
+            stoppedEvent = item.data as BuildIndexResponse
+          }
+        }
+      }
+
+      if (stoppedEvent) {
+        setIndexStage('索引已停止')
+        setStatusText(stoppedEvent.message || '索引任务已停止')
+        setHealth({ status: 'ok', indexed_chunks: stoppedEvent.indexed_chunks })
+        addMessage('system', `索引任务已停止，当前 chunks: ${stoppedEvent.indexed_chunks}。`)
+        return
+      }
+
+      if (!doneEvent) {
+        throw new Error('索引构建未正常完成')
+      }
+
+      setIndexProgress(100)
+      setIndexStage('索引构建完成')
+      setHealth({ status: 'ok', indexed_chunks: doneEvent.indexed_chunks })
+      const activeStrategy = doneEvent.strategy ?? strategy
+      const modeText = doneEvent.force_rebuild
+        ? '全量重建'
+        : (doneEvent.incremental ?? incremental)
+          ? '增量更新'
+          : '仅复用'
+      setStatusText(`${doneEvent.message}，模式: ${modeText}，策略: ${activeStrategy}，chunks: ${doneEvent.indexed_chunks}`)
+      addMessage('system', `索引已更新：${modeText} · 策略 ${activeStrategy} · ${doneEvent.indexed_chunks} chunks。`)
     } catch (err) {
       const msg = err instanceof Error ? err.message : '构建索引失败'
       setError(msg)
       setStatusText('索引失败')
+      setIndexStage('索引失败')
     } finally {
       setIndexing(false)
     }
   }
 
-  const fetchOverview = async () => {
+  const stopIndex = async () => {
     clearBanner()
-    setOverviewLoading(true)
     try {
-      const resp = await fetch(`${API_PREFIX}/overview`)
+      const resp = await fetch(`${API_PREFIX}/index/stop`, {
+        method: 'POST',
+      })
       if (!resp.ok) throw new Error(await readError(resp))
-      const data = (await resp.json()) as OverviewResponse
-      setOverview(data)
-      setStatusText('知识库概览已更新')
+      const data = (await resp.json()) as { message?: string; stopped?: boolean }
+      setStatusText(data.message || '已发送停止信号')
+      if (data.stopped) {
+        setIndexStage('停止中')
+      }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : '获取概览失败'
+      const msg = err instanceof Error ? err.message : '停止索引失败'
       setError(msg)
-      setStatusText('概览获取失败')
-    } finally {
-      setOverviewLoading(false)
+      setStatusText('停止索引失败')
     }
   }
 
@@ -201,16 +313,51 @@ function App() {
       const reader = resp.body.getReader()
       const decoder = new TextDecoder('utf-8')
       let result = ''
+      let sseBuffer = ''
+      let finished = false
+      let citations: CitationItem[] = []
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        result += decoder.decode(value, { stream: true })
-        updateMessage(assistantId, { content: result, pending: true })
+
+        sseBuffer += decoder.decode(value, { stream: true })
+        const { events, rest } = parseSseEvents(sseBuffer)
+        sseBuffer = rest
+
+        for (const item of events) {
+          if (item.event === 'token') {
+            const payload = item.data as { text?: string }
+            if (payload.text) {
+              result += payload.text
+              updateMessage(assistantId, { content: result, pending: true })
+            }
+          } else if (item.event === 'citations') {
+            const payload = item.data as { items?: CitationItem[] }
+            citations = Array.isArray(payload.items) ? payload.items : []
+          } else if (item.event === 'error') {
+            const payload = item.data as { message?: string }
+            throw new Error(payload.message || '流式问答失败')
+          } else if (item.event === 'done') {
+            finished = true
+          }
+        }
+
         chatBodyRef.current?.scrollTo({ top: chatBodyRef.current.scrollHeight, behavior: 'smooth' })
       }
 
-      updateMessage(assistantId, { content: result || '资料中没有相关信息。', pending: false })
+      if (!finished && !result) {
+        throw new Error('流式响应未正常完成')
+      }
+
+      updateMessage(assistantId, {
+        content: result || '资料中没有相关信息。',
+        pending: false,
+        citations,
+      })
+      if (citations.length > 0 && !selectedCitation) {
+        setSelectedCitation(citations[0])
+      }
       setStatusText('回答完成')
     } catch (err) {
       const msg = err instanceof Error ? err.message : '问答失败'
@@ -232,12 +379,24 @@ function App() {
           <button type="button" className="ghost" onClick={checkHealth}>
             检查后端状态
           </button>
-          <p className="status">{health ? `在线 · chunks ${health.indexed_chunks}` : '未检查'}</p>
+          <p className="status">
+            {health
+              ? `在线 · ${health.strategy ?? strategy} · chunks ${health.indexed_chunks}`
+              : '未检查'}
+          </p>
 
           <form onSubmit={buildIndex} className="stack">
             <label>
               文档目录
               <input value={dataDir} onChange={(e) => setDataDir(e.target.value)} placeholder="data" />
+            </label>
+
+            <label>
+              切分策略
+              <select value={strategy} onChange={(e) => setStrategy(e.target.value as 'simple' | 'recursive')}>
+                <option value="simple">simple</option>
+                <option value="recursive">recursive</option>
+              </select>
             </label>
 
             <label className="check">
@@ -246,15 +405,44 @@ function App() {
                 checked={forceRebuild}
                 onChange={(e) => setForceRebuild(e.target.checked)}
               />
-              强制重建索引
+              强制重建（清空后全量构建）
+            </label>
+
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={incremental}
+                onChange={(e) => setIncremental(e.target.checked)}
+                disabled={forceRebuild}
+              />
+              增量更新（关闭时仅复用已有索引）
             </label>
 
             <button type="submit" disabled={indexing}>
-              {indexing ? '构建中...' : '构建索引'}
+              {indexing ? '执行中...' : '执行索引'}
             </button>
+            <button type="button" className="ghost" disabled={!indexing} onClick={stopIndex}>
+              停止索引
+            </button>
+            <label>
+              重建进度
+              <progress value={indexProgress} max={100} />
+              <span>{indexProgress}% {indexStage ? `· ${indexStage}` : ''}</span>
+            </label>
           </form>
 
           <div className="stack">
+            <label>
+              检索策略
+              <select
+                value={retrieveStrategy}
+                onChange={(e) => setRetrieveStrategy(e.target.value as 'simple' | 'hybrid' | 'hybrid_rrk')}
+              >
+                <option value="simple">simple（向量检索）</option>
+                <option value="hybrid">hybrid（向量+BM25）</option>
+                <option value="hybrid_rrk">hybrid_rrk（预留）</option>
+              </select>
+            </label>
             <label>
               top_k
               <input
@@ -275,49 +463,6 @@ function App() {
               />
             </label>
           </div>
-
-          <div className="overview">
-            <div className="overview-title">
-              <h3>知识库概览</h3>
-              <button type="button" className="ghost" onClick={fetchOverview} disabled={overviewLoading}>
-                {overviewLoading ? '刷新中...' : '刷新'}
-              </button>
-            </div>
-
-            <div className="kpi-grid">
-              <div className="kpi-card">
-                <span>文档总数</span>
-                <strong>{overview ? overview.tracked_documents : '-'}</strong>
-              </div>
-              <div className="kpi-card">
-                <span>向量块数</span>
-                <strong>{overview ? overview.indexed_chunks : '-'}</strong>
-              </div>
-            </div>
-
-            <p className="tiny">
-              最近索引时间：
-              {overview?.last_indexed_at
-                ? new Date(overview.last_indexed_at * 1000).toLocaleString()
-                : '暂无'}
-            </p>
-
-            <input
-              value={docKeyword}
-              onChange={(e) => setDocKeyword(e.target.value)}
-              placeholder="按路径搜索文档"
-            />
-
-            <div className="doc-list">
-              {filteredDocs.slice(0, 80).map((doc) => (
-                <div key={doc.source} className="doc-item">
-                  <p className="doc-source">{doc.source}</p>
-                  <p className="doc-hash">{doc.content_hash.slice(0, 12)}...</p>
-                </div>
-              ))}
-              {overview && filteredDocs.length === 0 && <p className="tiny">没有匹配文档</p>}
-            </div>
-          </div>
         </div>
       </aside>
 
@@ -327,16 +472,61 @@ function App() {
             <h1>Knowledge Chat</h1>
             <p>{statusText}</p>
           </div>
-          {error && <span className="error-chip">{error}</span>}
+          <div className="chat-header-actions">
+            <button type="button" className="ghost" onClick={() => setViewerOpen((v) => !v)}>
+              {viewerOpen ? '折叠文档查看' : '展开文档查看'}
+            </button>
+            {error && <span className="error-chip">{error}</span>}
+          </div>
         </header>
 
-        <div className="chat-body" ref={chatBodyRef}>
-          {messages.map((msg) => (
-            <article key={msg.id} className={`bubble ${msg.role}`}>
-              <div className="role">{msg.role === 'user' ? '你' : msg.role === 'assistant' ? '助手' : '系统'}</div>
-              <div className="content">{msg.content || (msg.pending ? '正在生成...' : '')}</div>
-            </article>
-          ))}
+        <div className={`chat-main ${viewerOpen ? 'viewer-open' : ''}`}>
+          <div className="chat-body" ref={chatBodyRef}>
+            {messages.map((msg) => (
+              <article key={msg.id} className={`bubble ${msg.role}`}>
+                <div className="role">{msg.role === 'user' ? '你' : msg.role === 'assistant' ? '助手' : '系统'}</div>
+                <div className="content">{msg.content || (msg.pending ? '正在生成...' : '')}</div>
+                {msg.citations && msg.citations.length > 0 && (
+                  <div className="citation-links">
+                    {msg.citations.map((item, idx) => (
+                      <button
+                        type="button"
+                        key={`${item.source}-${item.chunk_id}-${idx}`}
+                        className="citation-link"
+                        onClick={() => {
+                          setSelectedCitation(item)
+                          setViewerOpen(true)
+                        }}
+                        title={`${toDataRelativeSource(item.source)} · chunk ${item.chunk_id}`}
+                      >
+                        [{idx + 1}] {toDataRelativeSource(item.source)}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+
+          <aside className={`doc-viewer ${viewerOpen ? 'open' : ''}`}>
+            <div className="doc-viewer-header">
+              <h3>文档查看</h3>
+              <button type="button" className="ghost" onClick={() => setViewerOpen(false)}>
+                折叠
+              </button>
+            </div>
+            {selectedCitation ? (
+              <div className="doc-viewer-body">
+                <p className="doc-viewer-source">
+                  {toDataRelativeSource(selectedCitation.source)} · chunk {selectedCitation.chunk_id}
+                </p>
+                <p className="doc-viewer-score">score: {selectedCitation.score.toFixed(3)}</p>
+                <pre>{selectedCitation.text}</pre>
+              </div>
+            ) : (
+              <p className="tiny">暂无可预览引用，先提问获取引用信息。</p>
+            )}
+          </aside>
         </div>
 
         <form className="chat-input" onSubmit={sendMessage}>
